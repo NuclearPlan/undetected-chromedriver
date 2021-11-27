@@ -1,76 +1,682 @@
 #!/usr/bin/env python3
 # this module is part of undetected_chromedriver
 
-"""
-V2 beta
-
-whats new: 
-
-    - currently this v2 module will be available as option.
-      to use it / test it, you need to alter your imports by appending .v2
-
-    - headless mode not (yet) supported in v2
-
-    example:
-
-    ```python
-    import undetected_chromedriver.v2 as uc
-    driver = uc.Chrome()
-    driver.get('https://somewebsite.xyz')
-
-    # if site is protected by hCaptcha/Cloudflare
-    driver.get_in('https://cloudflareprotectedsite.xyz')
-    
-    # if site is protected by hCaptcha/Cloudflare
-    # (different syntax, same function)
-    with driver:
-        driver.get('https://cloudflareprotectedsite.xyz')
-    ```
-
-    tests/example in ../tests/test_undetected_chromedriver.py
-
-"""
-
-
 from __future__ import annotations
 
-import io
+import asyncio
+import json
 import logging
 import os
-import random
 import re
 import shutil
-import string
-import subprocess
 import sys
 import tempfile
-import threading
 import time
-import zipfile
-import atexit
-import contextlib
-from distutils.version import LooseVersion
-from urllib.request import urlopen, urlretrieve
+import inspect
 
+import requests
 import selenium.webdriver.chrome.service
 import selenium.webdriver.chrome.webdriver
 import selenium.webdriver.common.service
 import selenium.webdriver.remote.webdriver
+import websockets
 
-__all__ = ("Chrome", "ChromeOptions", "Patcher", "find_chrome_executable")
+from .cdp import CDP
+from .options import ChromeOptions
+from .patcher import IS_POSIX
+from .patcher import Patcher
+from .reactor import Reactor
 
-IS_POSIX = sys.platform.startswith(("darwin", "cygwin", "linux"))
+__all__ = (
+    "Chrome",
+    "ChromeOptions",
+    "Patcher",
+    "Reactor",
+    "CDP",
+    "find_chrome_executable",
+)
 
 logger = logging.getLogger("uc")
+logger.setLevel(logging.getLogger().getEffectiveLevel())
+
+from .dprocess import start_detached
+
+
+class Chrome(selenium.webdriver.chrome.webdriver.WebDriver):
+    """
+
+    Controls the ChromeDriver and allows you to drive the browser.
+
+    The webdriver file will be downloaded by this module automatically,
+    you do not need to specify this. however, you may if you wish.
+
+    Attributes
+    ----------
+
+    Methods
+    -------
+
+    reconnect()
+
+        this can be useful in case of heavy detection methods
+        -stops the chromedriver service which runs in the background
+        -starts the chromedriver service which runs in the background
+        -recreate session
+
+
+    start_session(capabilities=None, browser_profile=None)
+
+        differentiates from the regular method in that it does not
+        require a capabilities argument. The capabilities are automatically
+        recreated from the options at creation time.
+
+    --------------------------------------------------------------------------
+        NOTE:
+            Chrome has everything included to work out of the box.
+            it does not `need` customizations.
+            any customizations MAY lead to trigger bot migitation systems.
+
+    --------------------------------------------------------------------------
+    """
+
+    _instances = set()
+    session_id = None
+
+    def __init__(
+            self,
+            executable_path=None,
+            port=0,
+            options=None,
+            enable_cdp_events=False,
+            service_args=None,
+            desired_capabilities=None,
+            service_log_path=None,
+            keep_alive=False,
+            log_level=0,
+            headless=False,
+            delay=5,
+            version_main=None,
+            patcher_force_close=False,
+    ):
+        """
+        Creates a new instance of the chrome driver.
+
+        Starts the service and then creates new instance of chrome driver.
+
+        Parameters
+        ----------
+        executable_path: str, optional, default: None - use find_chrome_executable
+            Path to the executable. If the default is used it assumes the executable is in the $PATH
+
+        port: int, optional, default: 0
+            port you would like the service to run, if left as 0, a free port will be found.
+
+        options: ChromeOptions, optional, default: None - automatic useful defaults
+            this takes an instance of ChromeOptions, mainly to customize browser behavior.
+            anything other dan the default, for example extensions or startup options
+            are not supported in case of failure, and can probably lowers your undetectability.
+
+        enable_cdp_events: bool, default: False
+            :: currently for chrome only
+            this enables the handling of wire messages
+            when enabled, you can subscribe to CDP events by using:
+
+                driver.add_cdp_listener("Network.dataReceived", yourcallback)
+                # yourcallback is an callable which accepts exactly 1 dict as parameter
+
+        service_args: list of str, optional, default: None
+            arguments to pass to the driver service
+
+        desired_capabilities: dict, optional, default: None - auto from config
+            Dictionary object with non-browser specific capabilities only, such as "item" or "loggingPref".
+
+        service_log_path: str, optional, default: None
+             path to log information from the driver.
+
+        keep_alive: bool, optional, default: True
+             Whether to configure ChromeRemoteConnection to use HTTP keep-alive.
+
+        log_level: int, optional, default: adapts to python global log level
+
+        headless: bool, optional, default: False
+            can also be specified in the options instance.
+            Specify whether you want to use the browser in headless mode.
+            warning: this lowers undetectability and not fully supported.
+
+        delay: int, optional, default: 5
+            delay in seconds to wait before giving back control.
+            this is used only when using the context manager
+            (`with` statement) to bypass, for example CloudFlare.
+            5 seconds is a foolproof value.
+
+        version_main: int, optional, default: None (=auto)
+            if you, for god knows whatever reason, use
+            an older version of Chrome. You can specify it's full rounded version number
+            here. Example: 87 for all versions of 87
+
+        patcher_force_close: bool, optional, default: False
+            instructs the patcher to do whatever it can to access the chromedriver binary
+            if the file is locked, it will force shutdown all instances.
+            setting it is not recommended, unless you know the implications and think
+            you might need it.
+        """
+
+        patcher = Patcher(
+            executable_path=executable_path,
+            force=patcher_force_close,
+            version_main=version_main,
+        )
+        patcher.auto()
+
+        if not options:
+            options = ChromeOptions()
+
+        try:
+            if hasattr(options, "_session") and options._session is not None:
+                #  prevent reuse of options,
+                #  as it just appends arguments, not replace them
+                #  you'll get conflicts starting chrome
+                raise RuntimeError("you cannot reuse the ChromeOptions object")
+        except AttributeError:
+            pass
+
+        options._session = self
+
+        debug_port = selenium.webdriver.common.service.utils.free_port()
+        debug_host = "127.0.0.1"
+
+        if not options.debugger_address:
+            options.debugger_address = "%s:%d" % (debug_host, debug_port)
+
+        if enable_cdp_events:
+            options.set_capability("goog:loggingPrefs", {"performance": "ALL"})
+
+        options.add_argument("--remote-debugging-host=%s" % debug_host)
+        options.add_argument("--remote-debugging-port=%s" % debug_port)
+
+        user_data_dir, language, keep_user_data_dir = None, None, None
+
+        # see if a custom user profile is specified
+        for arg in options.arguments:
+
+            if "lang" in arg:
+                m = re.search("(?:--)?lang(?:[ =])?(.*)", arg)
+                try:
+                    language = m[1]
+                except IndexError:
+                    logger.debug("will set the language to en-US,en;q=0.9")
+                    language = "en-US,en;q=0.9"
+
+            if "user-data-dir" in arg:
+                m = re.search("(?:--)?user-data-dir(?:[ =])?(.*)", arg)
+                try:
+                    user_data_dir = m[1]
+                    logger.debug(
+                        "user-data-dir found in user argument %s => %s" % (arg, m[1])
+                    )
+                    keep_user_data_dir = True
+
+                except IndexError:
+                    logger.debug(
+                        "no user data dir could be extracted from supplied argument %s "
+                        % arg
+                    )
+
+        if not user_data_dir:
+
+            if options.user_data_dir:
+                options.add_argument("--user-data-dir=%s" % options.user_data_dir)
+                keep_user_data_dir = True
+                logger.debug(
+                    "user_data_dir property found in options object: %s" % user_data_dir
+                )
+
+            else:
+                user_data_dir = os.path.normpath(tempfile.mkdtemp())
+                keep_user_data_dir = False
+                arg = "--user-data-dir=%s" % user_data_dir
+                options.add_argument(arg)
+                logger.debug(
+                    "created a temporary folder in which the user-data (profile) will be stored during this\n"
+                    "session, and added it to chrome startup arguments: %s" % arg
+                )
+
+        if not language:
+            try:
+                import locale
+
+                language = locale.getdefaultlocale()[0].replace("_", "-")
+            except Exception:
+                pass
+            if not language:
+                language = "en-US"
+
+        options.add_argument("--lang=%s" % language)
+
+        if not options.binary_location:
+            options.binary_location = find_chrome_executable()
+
+        self._delay = delay
+
+        self.user_data_dir = user_data_dir
+        self.keep_user_data_dir = keep_user_data_dir
+
+        if headless or options.headless:
+            options.headless = True
+            options.add_argument("--window-size=1920,1080")
+            options.add_argument("--start-maximized")
+            options.add_argument("--no-sandbox")
+            # fixes "could not connect to chrome" error when running
+            # on linux using privileged user like root (which i don't recommend)
+
+        options.add_argument(
+            "--log-level=%d" % log_level
+            or divmod(logging.getLogger().getEffectiveLevel(), 10)[0]
+        )
+
+        # fix exit_type flag to prevent tab-restore nag
+        try:
+            with open(
+                    os.path.join(user_data_dir, "Default/Preferences"),
+                    encoding="latin1",
+                    mode="r+",
+            ) as fs:
+                config = json.load(fs)
+                if config["profile"]["exit_type"] is not None:
+                    # fixing the restore-tabs-nag
+                    config["profile"]["exit_type"] = None
+                fs.seek(0, 0)
+                json.dump(config, fs)
+                logger.debug("fixed exit_type flag")
+        except Exception as e:
+            logger.debug("did not find a bad exit_type flag ")
+
+        self.options = options
+
+        if not desired_capabilities:
+            desired_capabilities = options.to_capabilities()
+
+        self.browser_pid = start_detached(options.binary_location, *options.arguments)
+
+        # self.browser = subprocess.Popen(
+        #     [options.binary_location, *options.arguments],
+        #     stdin=subprocess.PIPE,
+        #     stdout=subprocess.PIPE,
+        #     stderr=subprocess.PIPE,
+        #     close_fds=IS_POSIX,
+        # )
+
+        super(Chrome, self).__init__(
+            executable_path=patcher.executable_path,
+            port=port,
+            options=options,
+            service_args=service_args,
+            desired_capabilities=desired_capabilities,
+            service_log_path=service_log_path,
+            keep_alive=keep_alive,
+        )
+        # intentional
+        # self.webdriver = selenium.webdriver.chrome.webdriver.WebDriver(
+        #     executable_path=patcher.executable_path,
+        #     port=port,
+        #     options=options,
+        #     service_args=service_args,
+        #     desired_capabilities=desired_capabilities,
+        #     service_log_path=service_log_path,
+        #     keep_alive=keep_alive,
+        # )
+
+        self.reactor = None
+        if enable_cdp_events:
+
+            if logging.getLogger().getEffectiveLevel() == logging.DEBUG:
+                logging.getLogger(
+                    "selenium.webdriver.remote.remote_connection"
+                ).setLevel(20)
+
+            reactor = Reactor(self)
+            reactor.start()
+            self.reactor = reactor
+
+        if options.headless:
+            self._configure_headless()
+
+        orig_get = self.get
+
+        # def get_wrapped(*args, **kwargs):
+
+        #     self.execute_cdp_cmd(
+        #         "Network.setExtraHTTPHeaders",
+        #         {"headers": {"dnt": "1", "cache-control": "no-cache"}},
+        #     )
+        #
+        #     return orig_get(*args, **kwargs)
+        #
+        # self.get = get_wrapped
+
+    def _configure_headless(self):
+
+        orig_get = self.get
+
+        logger.info("setting properties for headless")
+
+        def get_wrapped(*args, **kwargs):
+
+            if self.execute_script("return navigator.webdriver"):
+                logger.info("patch navigator.webdriver")
+                self.execute_cdp_cmd(
+                    "Page.addScriptToEvaluateOnNewDocument",
+                    {
+                        "source": """
+                        
+                            Object.defineProperty(window, 'navigator', {
+                                value: new Proxy(navigator, {
+                                        has: (target, key) => (key === 'webdriver' ? false : key in target),
+                                        get: (target, key) =>
+                                                key === 'webdriver' ?
+                                                undefined :
+                                                typeof target[key] === 'function' ?
+                                                target[key].bind(target) :
+                                                target[key]
+                                        })
+                            });
+                            
+                    """
+                    },
+                )
+
+                logger.info("patch user-agent string")
+                self.execute_cdp_cmd(
+                    "Network.setUserAgentOverride",
+                    {
+                        "userAgent": self.execute_script(
+                            "return navigator.userAgent"
+                        ).replace("Headless", "")
+                    },
+                )
+
+            if self.options.mock_permissions:
+                logger.info("patch permissions api")
+
+                self.execute_cdp_cmd(
+                    "Page.addScriptToEvaluateOnNewDocument",
+                    {
+                        "source": """
+                                // fix Notification permission in headless mode
+                                Object.defineProperty(Notification, 'permission', { get: () => "default"});
+                        """
+                    },
+                )
+
+            if self.options.emulate_touch:
+                logger.info("patch emulate touch")
+
+                self.execute_cdp_cmd(
+                    "Page.addScriptToEvaluateOnNewDocument",
+                    {
+                        "source": """
+                            Object.defineProperty(navigator, 'maxTouchPoints', {
+                                    get: () => 1
+                            })"""
+                    },
+                )
+
+            if self.options.mock_canvas_fp:
+                logger.info("patch HTMLCanvasElement fingerprinting")
+
+                self.execute_cdp_cmd(
+                    "Page.addScriptToEvaluateOnNewDocument",
+                    {
+                        "source": """
+                        (function() {
+                            const ORIGINAL_CANVAS = HTMLCanvasElement.prototype[name];
+                            Object.defineProperty(HTMLCanvasElement.prototype, name, {
+                                    "value": function() {
+                                            var shift = {
+                                                    'r': Math.floor(Math.random() * 10) - 5,
+                                                    'g': Math.floor(Math.random() * 10) - 5,
+                                                    'b': Math.floor(Math.random() * 10) - 5,
+                                                    'a': Math.floor(Math.random() * 10) - 5
+                                            };
+                                            var width = this.width,
+                                                    height = this.height,
+                                                    context = this.getContext("2d");
+                                            var imageData = context.getImageData(0, 0, width, height);
+                                            for (var i = 0; i < height; i++) {
+                                                    for (var j = 0; j < width; j++) {
+                                                            var n = ((i * (width * 4)) + (j * 4));
+                                                            imageData.data[n + 0] = imageData.data[n + 0] + shift.r;
+                                                            imageData.data[n + 1] = imageData.data[n + 1] + shift.g;
+                                                            imageData.data[n + 2] = imageData.data[n + 2] + shift.b;
+                                                            imageData.data[n + 3] = imageData.data[n + 3] + shift.a;
+                                                    }
+                                            }
+                                            context.putImageData(imageData, 0, 0);
+                                            return ORIGINAL_CANVAS.apply(this, arguments);
+                                    }
+                            });
+                        })(this)
+                        """
+                    },
+                )
+
+            if self.options.mock_chrome_global:
+                self.execute_cdp_cmd(
+                    "Page.addScriptToEvaluateOnNewDocument",
+                    {
+                        "source": """
+                            
+                            Object.defineProperty(window, 'chrome', {
+                                value: new Proxy(window.chrome, {
+                                        has: (target, key) => true,
+                                        get: (target, key) => {
+                                                return {
+                                                        app: {
+                                                                isInstalled: false,
+                                                        },
+                                                        webstore: {
+                                                                onInstallStageChanged: {},
+                                                                onDownloadProgress: {},
+                                                        },
+                                                        runtime: {
+                                                                PlatformOs: {
+                                                                        MAC: 'mac',
+                                                                        WIN: 'win',
+                                                                        ANDROID: 'android',
+                                                                        CROS: 'cros',
+                                                                        LINUX: 'linux',
+                                                                        OPENBSD: 'openbsd',
+                                                                },
+                                                                PlatformArch: {
+                                                                        ARM: 'arm',
+                                                                        X86_32: 'x86-32',
+                                                                        X86_64: 'x86-64',
+                                                                },
+                                                                PlatformNaclArch: {
+                                                                        ARM: 'arm',
+                                                                        X86_32: 'x86-32',
+                                                                        X86_64: 'x86-64',
+                                                                },
+                                                                RequestUpdateCheckStatus: {
+                                                                        THROTTLED: 'throttled',
+                                                                        NO_UPDATE: 'no_update',
+                                                                        UPDATE_AVAILABLE: 'update_available',
+                                                                },
+                                                                OnInstalledReason: {
+                                                                        INSTALL: 'install',
+                                                                        UPDATE: 'update',
+                                                                        CHROME_UPDATE: 'chrome_update',
+                                                                        SHARED_MODULE_UPDATE: 'shared_module_update',
+                                                                },
+                                                                OnRestartRequiredReason: {
+                                                                        APP_UPDATE: 'app_update',
+                                                                        OS_UPDATE: 'os_update',
+                                                                        PERIODIC: 'periodic',
+                                                                },
+                                                        },
+                                                }
+                                        }
+                                })
+                            });
+                            """
+                    },
+                )
+
+            return orig_get(*args, **kwargs)
+
+        self.get = get_wrapped
+
+    def __dir__(self):
+        return object.__dir__(self)
+
+    def get(self, url):
+
+        tabs = requests.get('http://{0}:{1}/json'.format(*self.options.debugger_address.split(':'))).json()
+        for tab in tabs:
+            if tab['type'] == 'page':
+                break
+
+        async def _get():
+            wsurl = tab['webSocketDebuggerUrl']
+            async with websockets.connect(wsurl) as ws:
+                await ws.send(json.dumps({"method": "Page.navigate", "params": {"url": url}, "id": 1}))
+                return await ws.recv()
+
+        with self:
+            return asyncio.get_event_loop().run_until_complete(_get())
+
+    def add_cdp_listener(self, event_name, callback):
+        if (
+                self.reactor
+                and self.reactor is not None
+                and isinstance(self.reactor, Reactor)
+        ):
+            self.reactor.add_event_handler(event_name, callback)
+            return self.reactor.handlers
+        return False
+
+    def clear_cdp_listeners(self):
+        if self.reactor and isinstance(self.reactor, Reactor):
+            self.reactor.handlers.clear()
+
+    def tab_new(self, url: str):
+        """
+        this opens a url in a new tab.
+        apparently, that passes all tests directly!
+
+        Parameters
+        ----------
+        url
+
+        Returns
+        -------
+
+        """
+        if not hasattr(self, "cdp"):
+            from .cdp import CDP
+
+            self.cdp = CDP(self.options)
+        self.cdp.tab_new(url)
+
+    def reconnect(self, timeout=0.1):
+        try:
+            self.service.stop()
+        except Exception as e:
+            logger.debug(e)
+        time.sleep(timeout)
+        try:
+            self.service.start()
+        except Exception as e:
+            logger.debug(e)
+
+        try:
+            self.start_session()
+        except Exception as e:
+            logger.debug(e)
+
+    def start_session(self, capabilities=None, browser_profile=None):
+        if not capabilities:
+            capabilities = self.options.to_capabilities()
+        super(Chrome, self).start_session(capabilities, browser_profile)
+
+    def quit(self):
+        logger.debug("closing webdriver")
+        self.service.process.kill()
+        try:
+            if self.reactor and isinstance(self.reactor, Reactor):
+                self.reactor.event.set()
+        except Exception:  # noqa
+            pass
+        try:
+            logger.debug("killing browser")
+            os.kill(self.browser_pid)
+            # self.browser.terminate()
+            # self.browser.wait(1)
+
+        except TimeoutError as e:
+            logger.debug(e, exc_info=True)
+        except Exception:  # noqa
+            pass
+
+        if (
+                hasattr(self, "keep_user_data_dir")
+                and hasattr(self, "user_data_dir")
+                and not self.keep_user_data_dir
+        ):
+            for _ in range(5):
+                try:
+                    logger.debug("removing profile : %s" % self.user_data_dir)
+                    shutil.rmtree(self.user_data_dir, ignore_errors=False)
+                except FileNotFoundError:
+                    pass
+                except PermissionError:
+                    logger.debug(
+                        "permission error. files are still in use/locked. retying..."
+                    )
+                except (RuntimeError, OSError) as e:
+                    logger.debug("%s retying..." % e)
+                else:
+                    break
+                time.sleep(0.1)
+
+    def __del__(self):
+        try:
+            self.service.process.kill()
+        except:
+            pass
+        self.quit()
+
+    def __enter__(self):
+        try:
+            curframe = inspect.currentframe()
+            callframe = inspect.getouterframes(curframe, 2)
+            caller = callframe[1][3]
+            logging.getLogger(__name__).debug('__enter__ caller: %s' % caller)
+            if caller == 'get':
+                return
+        except (AttributeError, ValueError, KeyError, OSError) as e:
+            logging.getLogger(__name__).debug(e)
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.service.stop()
+        time.sleep(self._delay)
+        self.service.start()
+        self.start_session()
+
+    def __hash__(self):
+        return hash(self.options.debugger_address)
 
 
 def find_chrome_executable():
     """
-    returns the full path to the chrome _browser binary
-    may not work if chrome is in a custom folder.
+    Finds the chrome, chrome beta, chrome canary, chromium executable
 
-    :return: path to chrome executable
-    :rtype: str
+    Returns
+    -------
+    executable_path :  str
+        the full file path to found executable
+
     """
     candidates = set()
     if IS_POSIX:
@@ -83,454 +689,14 @@ def find_chrome_executable():
             )
     else:
         for item in map(
-            os.environ.get, ("PROGRAMFILES", "PROGRAMFILES(X86)", "LOCALAPPDATA")
+                os.environ.get, ("PROGRAMFILES", "PROGRAMFILES(X86)", "LOCALAPPDATA")
         ):
             for subitem in (
-                "Google/Chrome/Application",
-                "Google/Chrome Beta/Application",
-                "Google/Chrome Canary/Application",
+                    "Google/Chrome/Application",
+                    "Google/Chrome Beta/Application",
+                    "Google/Chrome Canary/Application",
             ):
                 candidates.add(os.sep.join((item, subitem, "chrome.exe")))
     for candidate in candidates:
         if os.path.exists(candidate) and os.access(candidate, os.X_OK):
             return os.path.normpath(candidate)
-
-
-class Chrome(object):
-
-    __doc__ = (
-        """\
-    --------------------------------------------------------------------------
-    NOTE: 
-    Chrome has everything included to work out of the box.
-    it does not `need` customizations.
-    any customizations MAY lead to trigger bot migitation systems.
-    
-    --------------------------------------------------------------------------
-    """
-        + selenium.webdriver.remote.webdriver.WebDriver.__doc__
-    )
-
-    _instances = set()
-
-    def __init__(
-        self,
-        executable_path="./chromedriver",
-        port=0,
-        options=None,
-        service_args=None,
-        desired_capabilities=None,
-        service_log_path=None,
-        chrome_options=None,
-        keep_alive=True,
-        debug_addr=None,
-        user_data_dir=None,
-        factor=1,
-        delay=2,
-        emulate_touch=False,
-    ):
-
-        p = Patcher(target_path=executable_path)
-        p.auto(False)
-
-        self._patcher = p
-        self.factor = factor
-        self.delay = delay
-        self.port = port
-        self.process = None
-        self.browser_args = None
-        self._rcount = 0
-        self._rdiff = 10
-
-        try:
-            dbg = debug_addr.split(":")
-            debug_host, debug_port = str(dbg[0]), int(dbg[1])
-        except AttributeError:
-            debug_port = selenium.webdriver.common.service.utils.free_port()
-            debug_host = "127.0.0.1"
-
-        if not debug_addr:
-            debug_addr = f"{debug_host}:{debug_port}"
-
-        if not user_data_dir:
-            user_data_dir = os.path.normpath(tempfile.mkdtemp())
-
-        if not options:
-            options = selenium.webdriver.chrome.webdriver.Options()
-
-        if not options.debugger_address:
-            options.debugger_address = debug_addr
-
-        if not options.binary_location:
-            options.binary_location = find_chrome_executable()
-
-        if not desired_capabilities:
-            desired_capabilities = options.to_capabilities()
-
-        self.options = options
-        self.user_data_dir = user_data_dir
-
-        extra_args = options.arguments
-
-        if options.headless:
-            extra_args.append("--headless")
-            extra_args.append("--window-size=1920,1080")
-
-        self.browser_args = [
-            find_chrome_executable(),
-            "--user-data-dir=%s" % user_data_dir,
-            "--remote-debugging-host=%s" % debug_host,
-            "--remote-debugging-port=%s" % debug_port,
-            "--log-level=%d" % divmod(logging.getLogger().getEffectiveLevel(), 10)[0],
-            *extra_args,
-        ]
-
-        self.browser = subprocess.Popen(
-            self.browser_args,
-            # close_fds="win32" in sys.platform,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-
-        self.webdriver = selenium.webdriver.chrome.webdriver.WebDriver(
-            executable_path=p.target_path,
-            port=port,
-            options=options,
-            service_args=service_args,
-            desired_capabilities=desired_capabilities,
-            service_log_path=service_log_path,
-            chrome_options=chrome_options,
-            keep_alive=keep_alive,
-        )
-
-        if options.headless:
-
-            orig_get = self.webdriver.get
-
-            logger.info("setting properties for headless")
-
-            def get_wrapped(*args, **kwargs):
-
-                if self.execute_script("return navigator.webdriver"):
-                    self.execute_cdp_cmd(
-                        "Page.addScriptToEvaluateOnNewDocument",
-                        {
-                            "source": """
-                                Object.defineProperty(window, 'navigator', {
-                                    value: new Proxy(navigator, {
-                                    has: (target, key) => (key === 'webdriver' ? false : key in target),
-                                    get: (target, key) =>
-                                        key === 'webdriver'
-                                        ? undefined
-                                        : typeof target[key] === 'function'
-                                        ? target[key].bind(target)
-                                        : target[key]
-                                    })
-                                });
-
-                                Object.defineProperty(Notification, "permission", {
-                                    configurable: true,
-                                    enumerable: true,
-                                        get: () => {
-                                            return "unknown"
-                                        },       
-                                    });
-                            """
-                        },
-                    )
-
-                    logger.info("removing headless from user-agent string")
-
-                    self.execute_cdp_cmd(
-                        "Network.setUserAgentOverride",
-                        {
-                            "userAgent": self.execute_script(
-                                "return navigator.userAgent"
-                            ).replace("Headless", "")
-                        },
-                    )
-                    logger.info("fixing notifications permission in headless browsers")
-
-                if emulate_touch:
-                    self.execute_cdp_cmd(
-                        "Page.addScriptToEvaluateOnNewDocument",
-                        {
-                            "source": """
-                                Object.defineProperty(navigator, 'maxTouchPoints', {
-                                        get: () => 1
-                                })"""
-                        },
-                    )
-                return orig_get(*args, **kwargs)
-
-            self.webdriver.get = get_wrapped
-
-    def __getattribute__(self, attr):
-        try:
-            return object.__getattribute__(self, attr)
-        except AttributeError:
-            try:
-                return object.__getattribute__(self.webdriver, attr)
-            except AttributeError:
-                raise
-
-    def __dir__(self):
-        return object.__dir__(self) + object.__dir__(self.webdriver)
-
-    def start_session(self, capabilities=None, browser_profile=None):
-        if not capabilities:
-            capabilities = self.options.to_capabilities()
-        self.webdriver.start_session(capabilities, browser_profile)
-
-    def get_in(self, url: str, delay=2, factor=1):
-        """
-        :param url: str
-        :param delay: int
-        :param factor: disconnect <factor> seconds after .get()
-                       too low will disconnect before get() fired.
-
-        =================================================
-
-        In case you are being detected by some sophisticated
-        algorithm, and you are the kind that hates losing,
-        this might be your friend.
-
-        this currently works for hCaptcha based systems
-        (this includes CloudFlare!), and also passes many
-        custom setups (eg: ticketmaster.com),
-
-
-        Once you are past the first challenge, a cookie is saved
-        which (in my tests) also worked for other sites, and lasted
-        my entire session! However, to play safe, i'd recommend to just
-        call it once for every new site/domain you navigate to.
-
-        NOTE:   mileage may vary!
-                bad behaviour can still be detected, and this program does not
-                magically "fix" a flagged ip.
-
-                please don't spam issues on github! first look if the issue
-                is not already reported.
-        """
-        try:
-            self.get(url)
-        finally:
-            self.service.stop()
-            # threading.Timer(factor or self.factor, self.close).start()
-            time.sleep(delay or self.delay)
-            self.service.start()
-            self.start_session()
-
-    def quit(self):
-        logger.debug("closing webdriver")
-        try:
-            self.webdriver.quit()
-        except Exception:  # noqa
-            pass
-        try:
-            logger.debug("killing browser")
-            self.browser.kill()
-            self.browser.wait(1)
-        except TimeoutError as e:
-            logger.debug(e, exc_info=True)
-        except Exception:  # noqa
-            pass
-        try:
-            logger.debug("removing profile : %s" % self.user_data_dir)
-            shutil.rmtree(self.user_data_dir, ignore_errors=False)
-        except PermissionError:
-            logger.debug("permission error. files are still in use/locked. retying...")
-            time.sleep(1)
-            self.quit()
-
-    def __del__(self):
-        self.quit()
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        self.service.stop()
-        # threading.Timer(self.factor, self.service.start).start()
-        time.sleep(self.delay)
-        self.service.start()
-        self.start_session()
-
-    def __hash__(self):
-        return hash(self.options.debugger_address)
-
-
-class Patcher(object):
-    url_repo = "https://chromedriver.storage.googleapis.com"
-
-    def __init__(
-        self, target_path="./chromedriver", force=False, version_main: int = 0
-    ):
-        if not IS_POSIX:
-            if not target_path[-4:] == ".exe":
-                target_path += ".exe"
-
-        self.force = force
-        z, e = self.get_package_name()
-        if not target_path:
-            target_path = e
-
-        self.exename = e
-        self.target_path = target_path
-        self.zipname = z
-        self.version_main = version_main
-        self.version_full = None
-
-    def auto(self, force=False):
-        try:
-            os.unlink(self.target_path)
-        except PermissionError:
-
-            if force or self.force:
-                self.force_kill_instances()
-                return self.auto()
-
-            if self.verify_patch():
-                # assumes already running AND patched
-                return True
-            return False
-        except FileNotFoundError:
-            pass
-
-        release = self.fetch_release_number()
-        self.version_main = release.version[0]
-        self.version_full = release
-        self.fetch_package()
-        self.unzip_package()
-        self.patch_exe()
-        return self.verify_patch()
-
-    def fetch_release_number(self):
-        """
-        Gets the latest major version available, or the latest major version of self.target_version if set explicitly.
-        :return: version string
-        :rtype: LooseVersion
-        """
-        path = "/latest_release"
-        if self.version_main:
-            path += f"_{self.version_main}"
-        path = path.upper()
-        logger.debug("getting release number from %s" % path)
-        return LooseVersion(urlopen(self.url_repo + path).read().decode())
-
-    def parse_exe_version(self):
-        with io.open(self.target_path, "rb") as f:
-            for line in iter(lambda: f.readline(), b""):
-                match = re.search(br"platform_handle\x00content\x00([0-9\.]*)", line)
-                if match:
-                    return LooseVersion(match[1].decode())
-
-    def fetch_package(self):
-        """
-        Downloads ChromeDriver from source
-
-        :return: path to downloaded file
-        """
-        u = "%s/%s/%s" % (self.url_repo, self.version_full.vstring, self.zipname)
-        logger.debug("downloading from %s" % u)
-        zp, *_ = urlretrieve(u, filename=self.zipname)
-        return zp
-
-    def unzip_package(self):
-        """
-        Does what it says
-
-        :return: path to unpacked executable
-        """
-        logger.debug("unzipping %s" % self.zipname)
-        try:
-            os.makedirs(os.path.dirname(self.target_path), mode=0o755)
-        except OSError:
-            pass
-        with zipfile.ZipFile(self.zipname, mode="r") as zf:
-            zf.extract(self.exename)
-        os.rename(self.exename, self.target_path)
-        os.remove(self.zipname)
-        os.chmod(self.target_path, 0o755)
-        return self.target_path
-
-    @staticmethod
-    def get_package_name():
-        """
-        returns a tuple of (zipname, exename) depending on platform.
-
-        :return: (zipname, exename)
-        """
-        zipname = "chromedriver_%s.zip"
-        exe = "chromedriver%s"
-        platform = sys.platform
-        if platform.endswith("win32"):
-            zipname %= "win32"
-            exe %= ".exe"
-        if platform.endswith("linux"):
-            zipname %= "linux64"
-            exe %= ""
-        if platform.endswith("darwin"):
-            zipname %= "mac64"
-            exe %= ""
-        return zipname, exe
-
-    def force_kill_instances(self):
-        """
-        kills running instances.
-
-        :param self:
-        :return: True on success else False
-        """
-        if IS_POSIX:
-            r = os.system("kill -f -9 $(pidof %s)" % self.exename)
-        else:
-            r = os.system("taskkill /f /im %s" % self.exename)
-        return not r
-
-    @staticmethod
-    def gen_random_cdc():
-        cdc = random.choices(string.ascii_lowercase, k=26)
-        cdc[-6:-4] = map(str.upper, cdc[-6:-4])
-        cdc[2] = cdc[0]
-        cdc[3] = "_"
-        return "".join(cdc).encode()
-
-    def verify_patch(self):
-        """simple check if executable is patched.
-
-        :return: False if not patched, else True
-        """
-        try:
-            with io.open(self.target_path, "rb") as fh:
-                for line in iter(lambda: fh.readline(), b""):
-                    if b"cdc_" in line:
-                        return False
-            return True
-        except FileNotFoundError:
-            return False
-
-    def patch_exe(self):
-        """
-        Patches the ChromeDriver binary
-
-        :return: False on failure, binary name on success
-        """
-
-        logger.info("patching driver executable %s" % self.target_path)
-
-        linect = 0
-        replacement = self.gen_random_cdc()
-        with io.open(self.target_path, "r+b") as fh:
-            for line in iter(lambda: fh.readline(), b""):
-                if b"cdc_" in line:
-                    fh.seek(-len(line), 1)
-                    newline = re.sub(b"cdc_.{22}", replacement, line)
-                    fh.write(newline)
-                    linect += 1
-            return linect
-
-
-class ChromeOptions(selenium.webdriver.chrome.webdriver.Options):
-    pass
